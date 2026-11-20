@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using PeNet;
-using PeNet.Header.Pe;
 using RbxFFlagDumper.Lib.Exceptions;
 
 namespace RbxFFlagDumper.Lib
@@ -73,97 +72,192 @@ namespace RbxFFlagDumper.Lib
             return finalList;
         }
 
-        private static int GetRVAOffset(ImageSectionHeader sectionHeader)
-            => (int)(sectionHeader.VirtualAddress - sectionHeader.PointerToRawData);
-
         /// <summary>
-        /// Dumps all C++ defined flags found within the RobloxStudioBeta executable
+        /// Dumps all C++ defined flags found within the RobloxStudioBeta executable.
         /// </summary>
         /// <param name="studioExePath"></param>
         /// <returns></returns>
         /// <exception cref="CppDumpException">
         /// Thrown when an issue with C++ dumping occurs.
         /// </exception>
+        /// <remarks>
+        /// Modern Studio builds no longer register flags through per-flag code thunks in
+        /// <c>.text</c>. Instead <c>.rdata</c> holds an 8 byte aligned table of descriptor
+        /// records. A flag descriptor is:
+        /// <code>
+        ///   +0x00  const char* name     ; absolute VA of the flag name in .rdata
+        ///   +0x08  size_t      nameLen  ; length of the name (excluding the null)
+        ///   +0x10  void*       variable ; absolute VA of the mutable value in .data
+        ///   +0x18  uint32      scope    ; 1 = static "F", 2 = dynamic "DF", 4 = synced "SF"
+        ///   +0x1C  uint32      type     ; 0/1 = Flag, 2 = Int, 3 = String, 4 = Log
+        /// </code>
+        /// Versioned flags additionally have a record in the same region whose third field
+        /// is a small integer version rather than a <c>.data</c> pointer:
+        /// <code>
+        ///   +0x00  const char* name     ;
+        ///   +0x08  size_t      nameLen  ;
+        ///   +0x10  size_t      version  ; appended to the flag name when greater than 1
+        /// </code>
+        /// </remarks>
         public static List<string> DumpCppFlags(string studioExePath)
         {
             byte[] binary = File.ReadAllBytes(studioExePath);
+            var pe = new PeFile(binary);
 
-            var sectionHeaders = new PeFile(binary).ImageSectionHeaders;
-            var textHeader = sectionHeaders.First(x => x.Name == ".text");
+            ulong imageBase = pe.ImageNtHeaders.OptionalHeader.ImageBase;
+            var sectionHeaders = pe.ImageSectionHeaders;
+
             var rdataHeader = sectionHeaders.First(x => x.Name == ".rdata");
-            int rvaOffset = GetRVAOffset(textHeader) - GetRVAOffset(rdataHeader);
+            var dataHeader = sectionHeaders.First(x => x.Name == ".data");
 
-            // this snippet is present for each registered fflag in RobloxStudioBeta.exe
-            // 00:  41 B8 ?? ?? ?? ??    | mov r8d, <val>     ; byte, determines if dynamic
-            // 06:  48 8D 15 ?? ?? ?? ?? | lea rdx, <addr>    ; 
-            // 13:  48 8D 0D ?? ?? ?? ?? | lea rcx, <addr>    ; fflag name
-            // 20:  E9 ?? ?? ?? ??       | jmp <addr>         ; registration routine, determines data type (FFlag, SFFlag, FString, etc)
+            int rdataOffset = (int)rdataHeader.PointerToRawData;
+            int rdataLength = (int)Math.Min(rdataHeader.SizeOfRawData, (uint)(binary.Length - rdataOffset)) & ~7;
+            int rdataLimit = rdataOffset + rdataLength - 32;
 
-            string pattern = "41 B8 ?? 00 00 00 48 8D 15 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E9";
-            var scanner = new PatternScanner(binary, pattern, (int)textHeader.PointerToRawData, (int)textHeader.SizeOfRawData);
+            ulong rdataStart = imageBase + rdataHeader.VirtualAddress;
+            ulong rdataEnd = rdataStart + rdataHeader.VirtualSize;
 
-            var dataTypeTable = new Dictionary<int, string>();
-            var rawFFlagData = new List<RawFFlagData>();
+            ulong dataStart = imageBase + dataHeader.VirtualAddress;
+            ulong dataEnd = dataStart + Math.Max((ulong)dataHeader.VirtualSize, (ulong)dataHeader.SizeOfRawData);
 
-            while (!scanner.Finished())
+            // Bare flag name -> full typed name (e.g. "HttpBatchLimit" -> "DFIntHttpBatchLimit").
+            var flags = new Dictionary<string, string>();
+            // Bare flag name -> highest registered version.
+            var versions = new Dictionary<string, ulong>();
+
+            for (int pos = rdataOffset; pos <= rdataLimit; pos += 8)
             {
-                int pos = scanner.FindNext();
+                ulong namePtr = BitConverter.ToUInt64(binary, pos);
 
-                if (pos == -1)
-                    break;
+                if (namePtr < rdataStart || namePtr >= rdataEnd)
+                    continue;
 
-                int param = binary[pos + 2];
+                ulong nameLen = BitConverter.ToUInt64(binary, pos + 8);
 
-                // resolving the pointer with a constant offset since we can just assume it will always point to .rdata
-                int namePtr = pos + 20 + BitConverter.ToInt32(binary, pos + 16) + rvaOffset;
-                int targetAddr = pos + 25 + BitConverter.ToInt32(binary, pos + 21);
+                if (nameLen < 1 || nameLen > 256)
+                    continue;
 
-                string name = "";
+                ulong third = BitConverter.ToUInt64(binary, pos + 16);
 
-                for (int i = namePtr; binary[i] != 0; i++)
+                if (third >= dataStart && third < dataEnd)
                 {
-                    if (binary[i] < 0x20 || binary[i] > 0x7F)
-                        throw new CppDumpException("Encountered invalid data");
+                    string scopePrefix = ScopePrefix(BitConverter.ToUInt32(binary, pos + 24));
+                    string typeWord = TypeWord(BitConverter.ToUInt32(binary, pos + 28));
 
-                    name += Convert.ToChar(binary[i]);
+                    if (scopePrefix == null || typeWord == null)
+                        continue;
+
+                    int nameOff = rdataOffset + (int)(namePtr - rdataStart);
+                    string name = ReadFlagName(binary, nameOff, (int)nameLen);
+
+                    if (name != null)
+                        flags[name] = scopePrefix + typeWord + name;
                 }
+                else if (third > 0 && third < 0x10000)
+                {
+                    int nameOff = rdataOffset + (int)(namePtr - rdataStart);
+                    string name = ReadFlagName(binary, nameOff, (int)nameLen);
 
-                rawFFlagData.Add(new RawFFlagData(targetAddr, param, name));
+                    if (name == null)
+                        continue;
 
-                if (!dataTypeTable.ContainsKey(targetAddr))
-                    dataTypeTable[targetAddr] = null;
+                    if (!versions.TryGetValue(name, out ulong existing) || third > existing)
+                        versions[name] = third;
+                }
             }
 
-            // currently only two SFFlags exist - would there ever be zero?
-            if (dataTypeTable.Count != 5)
-                throw new CppDumpException("Expected 5 different flag types");
-
-            // the registration routines for each flag type are stored in memory consecutively in this order
-            dataTypeTable = dataTypeTable.OrderBy(x => x.Key).ToDictionary(x => x.Key, x => x.Value);
-            dataTypeTable[dataTypeTable.Keys.ElementAt(0)] = "FFlag";
-            dataTypeTable[dataTypeTable.Keys.ElementAt(1)] = "SFFlag";
-            dataTypeTable[dataTypeTable.Keys.ElementAt(2)] = "FInt";
-            dataTypeTable[dataTypeTable.Keys.ElementAt(3)] = "FLog";
-            dataTypeTable[dataTypeTable.Keys.ElementAt(4)] = "FString";
+            if (flags.Count < 1)
+                throw new CppDumpException(
+                    "No C++ flags found; the Studio flag table layout may have changed.");
 
             var finalList = new List<string>();
 
-            foreach (var entry in rawFFlagData)
+            foreach (var flag in flags)
             {
-                string dataType = dataTypeTable[entry.DataTypeId];
-                string name = "";
+                string fullName = flag.Value;
 
-                if (entry.ByteParam == 2)
-                    name += "D";
+                if (versions.TryGetValue(flag.Key, out ulong version) && version > 1)
+                    fullName += version;
 
-                name += dataType;
-                name += entry.Name;
-
-                finalList.Add(name);
+                finalList.Add(fullName);
             }
 
             finalList.Sort();
             return finalList;
+        }
+
+        /// <summary>
+        /// Maps the high dword of a flag's packed type field to its data type word.
+        /// Returns null for an unrecognised value so the record can be skipped.
+        /// </summary>
+        private static string TypeWord(uint dataType)
+        {
+            switch (dataType)
+            {
+                case 0:
+                case 1:
+                    return "Flag";
+                case 2:
+                    return "Int";
+                case 3:
+                    return "String";
+                case 4:
+                    return "Log";
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Maps the low dword of a flag's packed type field to its scope prefix.
+        /// Returns null for an unrecognised value so the record can be skipped.
+        /// </summary>
+        private static string ScopePrefix(uint scope)
+        {
+            switch (scope)
+            {
+                case 1:
+                    return "F";
+                case 2:
+                    return "DF";
+                case 4:
+                    return "SF";
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Reads a flag name of exactly <paramref name="length"/> word characters
+        /// (letters, digits and underscore) terminated by a null byte. Returns null when
+        /// the bytes do not form a valid name, which rejects coincidental records.
+        /// </summary>
+        private static string ReadFlagName(byte[] binary, int offset, int length)
+        {
+            if (offset < 0 || offset + length + 1 > binary.Length)
+                return null;
+
+            if (binary[offset + length] != 0)
+                return null;
+
+            var chars = new char[length];
+
+            for (int i = 0; i < length; i++)
+            {
+                byte b = binary[offset + i];
+
+                bool isWordChar = (b >= '0' && b <= '9')
+                               || (b >= 'A' && b <= 'Z')
+                               || (b >= 'a' && b <= 'z')
+                               || b == '_';
+
+                if (!isWordChar)
+                    return null;
+
+                chars[i] = (char)b;
+            }
+
+            return new string(chars);
         }
     }
 }
